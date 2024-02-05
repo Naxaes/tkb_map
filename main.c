@@ -30,6 +30,8 @@ static const f32 HASHMAP_DEFAULT_LOAD_FACTOR = 0.75f;
 /// it reallocates.
 static const f32 HASHMAP_DEFAULT_GROW_FACTOR = 2.0f;
 
+static const size_t HASHMAP_EMPTY_SLOT = 0xFFFFFFFFFFFFFFFFULL;
+
 
 typedef struct HashMapHeader {
     /// Custom allocator to use for the allocation,
@@ -173,7 +175,7 @@ HashMap* hashmap_new(struct Allocator* allocator, size_t capacity, float load_fa
 
     // Clear the indices to be dead. This is important since we use the index as a sentinel
     // to check if the slot is empty.
-    memset(header+1, 0xFF, index_capacity * index_stride);
+    memset(header+1, (u8)HASHMAP_EMPTY_SLOT, index_capacity * index_stride);
 
     *header = (HashMapHeader) {
         .allocator    = allocator,
@@ -212,6 +214,8 @@ void* hashmap_get(const HashMap* map, const void* key, hash_function hash_key, c
     size_t index_capacity = header->index_capacity;
     size_t index_stride   = header->index_stride;
     size_t index_mask     = header->index_mask;
+    size_t count          = header->count;
+    size_t counter        = count;
 
     const u8* indices = (u8*)map;
     const u8* keys    = (u8*)indices + index_capacity * index_stride;
@@ -219,13 +223,11 @@ void* hashmap_get(const HashMap* map, const void* key, hash_function hash_key, c
 
     size_t hash_mask = index_capacity - 1;
     size_t hash      = hash_key(key, key_stride);
-    while (1) {
+    do {
         size_t index = hash & hash_mask;
-
-        // size_t index = hash & ((2*header->capacity)-1);
         size_t slot  = *(size_t*)(indices + index * index_stride) & index_mask;
 
-        if (slot == index_mask) {
+        if (slot >= index-1) {
             return NULL;
         }
 
@@ -235,7 +237,9 @@ void* hashmap_get(const HashMap* map, const void* key, hash_function hash_key, c
         }
 
         hash = (hash + 1) & hash_mask;
-    }
+    } while (--counter);
+
+    return NULL;
 }
 
 
@@ -249,10 +253,13 @@ int hashmap_set(HashMap** map, const void* key, const void* value, hash_function
     size_t index_mask     = header->index_mask;
     size_t load_factor    = header->load_factor;
     size_t count          = header->count;
+    size_t counter        = count;
 
     u8* indices = (u8*)*map;
     u8* keys    = (u8*)indices + index_capacity * index_stride;
     u8* values  = (u8*)keys + capacity * key_stride;
+
+    const size_t deleted_slot = index_mask - 1;
 
     size_t hash_mask  = index_capacity - 1;
     size_t hash       = hash_key(key, key_stride);
@@ -260,7 +267,7 @@ int hashmap_set(HashMap** map, const void* key, const void* value, hash_function
         size_t index = hash & hash_mask;
         size_t slot  = *(size_t*)(indices + index * index_stride) & index_mask;
 
-        if (slot == index_mask) {
+        if (slot >= deleted_slot) {
             if (capacity * load_factor <= count * 100ULL) {
                 hashmap_grow(map, hash_key, compare_key);
                 return hashmap_set(map, key, value, hash_key, compare_key);
@@ -281,23 +288,109 @@ int hashmap_set(HashMap** map, const void* key, const void* value, hash_function
 
         hash = (hash + 1) & hash_mask;
 
-        // This is necessary to avoid infinite loops when
-        // the load factor is 1 and the hashmap is full.
-        // We could check whether the second to last element
-        // inserted requires the hashmap to grow, but that
-        // would require the hashmap to regrow before hitting
-        // the capacity. This is probably not expected as the
-        // user would not expect the hashmap to grow when the
-        // load factor is 1 and haven't reached the capacity.
-        // We could check this before the loop, but that would
-        // require an extra branch for every insertion, instead
-        // of just the one's that collide.
-        if (count == capacity) {
-            hashmap_grow(map, hash_key, compare_key);
-            return hashmap_set(map, key, value, hash_key, compare_key);
-        }
-    } while (1);
+
+    // This is necessary to avoid infinite loops when
+    // the load factor is 1 and the hashmap is full.
+    // We could check whether the second to last element
+    // inserted requires the hashmap to grow, but that
+    // would require the hashmap to regrow before hitting
+    // the capacity. This is probably not expected as the
+    // user would not expect the hashmap to grow when the
+    // load factor is 1 and haven't reached the capacity.
+    // We could check this before the loop, but that would
+    // require an extra branch for every insertion, instead
+    // of just the one's that collide.
+    } while (--counter);
+
+    hashmap_grow(map, hash_key, compare_key);
+    return hashmap_set(map, key, value, hash_key, compare_key);
 }
+
+
+void* hashmap_del(HashMap** map, const void* key, hash_function hash_key, compare_function compare_key) {
+    HashMapHeader* header = HASHMAP_HEADER(*map);
+    size_t capacity       = header->capacity;
+    size_t key_stride     = header->key_stride;
+    size_t value_stride   = header->value_stride;
+    size_t index_capacity = header->index_capacity;
+    size_t index_stride   = header->index_stride;
+    size_t index_mask     = header->index_mask;
+    size_t count          = header->count;
+    size_t counter        = count;
+
+    u8* indices = (u8*)*map;
+    u8* keys    = (u8*)indices + index_capacity * index_stride;
+    u8* values  = (u8*)keys + capacity * key_stride;
+
+    const size_t deleted_slot = index_mask - 1;
+
+    size_t hash_mask  = index_capacity - 1;
+    size_t hash       = hash_key(key, key_stride);
+    do {
+        size_t index = hash & hash_mask;
+        size_t slot  = *(size_t*)(indices + index * index_stride) & index_mask;
+
+        if (slot >= deleted_slot) {
+            return NULL;
+        }
+
+        u8* existing_key = keys + slot * key_stride;
+        if (compare_key(key, existing_key, key_stride) == 0) {
+
+            // If the slot is not the last slot, we need to move the last slot
+            // to the slot we just deleted.
+            if (slot != count - 1) {
+
+                // Find the last slot by iterating through the indices
+                // and find the last slot that points to the end.
+                size_t last_slot;
+                for (size_t i = 0; i < index_capacity; ++i) {
+                    last_slot = *(size_t*)(indices + i * index_stride) & index_mask;
+                    if (last_slot == count - 1) {
+                        // Copy the last slot to the slot we just deleted.
+                        memcpy(indices + i * index_stride, &slot, index_stride);
+                        // Mark the slot as deleted
+                        memcpy(indices + index * index_stride, &deleted_slot, index_stride);
+                        break;
+                    }
+                }
+
+                // Copy the last key to the slot we just deleted.
+                u8* key_a = keys + slot * key_stride;
+                u8* key_b = keys + last_slot * key_stride;
+                memcpy(key_a, key_b, key_stride);
+
+                // Copy the last value to the slot we just deleted.
+                u8* val_a = values + slot * value_stride;
+                u8* val_b = values + last_slot * value_stride;
+                memcpy(val_a, val_b, value_stride);
+            } else {
+                // Mark the slot as deleted
+                memcpy(indices + index * index_stride, &deleted_slot, index_stride);
+            }
+
+            header->count -= 1;
+            return values + slot * value_stride;
+        }
+
+        hash = (hash + 1) & hash_mask;
+
+    // This is necessary to avoid infinite loops when
+    // the load factor is 1 and the hashmap is full.
+    // We could check whether the second to last element
+    // inserted requires the hashmap to grow, but that
+    // would require the hashmap to regrow before hitting
+    // the capacity. This is probably not expected as the
+    // user would not expect the hashmap to grow when the
+    // load factor is 1 and haven't reached the capacity.
+    // We could check this before the loop, but that would
+    // require an extra branch for every insertion, instead
+    // of just the one's that collide.
+    } while (--counter);
+
+    return NULL;
+}
+
 
 
 void hashmap_grow(HashMap** map, hash_function hash_key, compare_function compare_key) {
@@ -328,7 +421,7 @@ void hashmap_grow(HashMap** map, hash_function hash_key, compare_function compar
     u8* old_keys    = (u8*)old_indices + old_index_capacity * old_index_stride;
     u8* old_values  = (u8*)old_keys + old_capacity * key_stride;
 
-    memset(new_header+1, 0xFF, new_index_capacity * new_index_stride);
+    memset(new_header+1, (u8)HASHMAP_EMPTY_SLOT, new_index_capacity * new_index_stride);
     *new_header = (HashMapHeader) {
             .allocator      = allocator,
             .count          = 0,
@@ -399,6 +492,7 @@ int compare_string(const void* key, const void* candidate, size_t stride) {
     static inline VALUE*  prefix##_values(const Class* map)                                                           { return (VALUE*) hashmap_values((const HashMap*)map);   }                                                                  \
     static inline VALUE*  prefix##_get(const Class* map, KEY key)                                                     { return (VALUE*) hashmap_get((const HashMap*)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }          \
     static inline int     prefix##_set(Class** map, KEY key, VALUE value)                                             { return hashmap_set((HashMap**)map, (const void*)&key, (const void*)&value, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
+    static inline VALUE*  prefix##_del(Class** map, KEY key)                                                          { return hashmap_del((HashMap**)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
     static inline void    prefix##_grow(Class** map)                                                                  { hashmap_grow((HashMap**)map, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }                                                 \
     static inline int     prefix##_set_load_factor(Class* map, float factor)                                          { return hashmap_set_load_factor((HashMap*)map, factor);  }                                        \
     static inline int     prefix##_set_grow_factor(Class* map, float factor)                                          { return hashmap_set_grow_factor((HashMap*)map, factor);  }                                        \
@@ -422,13 +516,19 @@ int main(int argc, const char* argv[]) {
     strmap_set_grow_factor(map, 2.0f);
 
     for (int i = 0; i < 0xFFFFF; ++i) {
-        int size = (rand() & 31) + 1;
+        int size = (rand() & 31) + 2;
         char* key = malloc(size);
         for (int j = 0; j < size-1; ++j) {
-            key[j] = 'A' + (char)(rand() % (122-65));
+            key[j] = 'A' + (char)(rand() % ('Z' - 'A' + 1));
         }
         key[size-1] = 0;
         strmap_set(&map, key, i);
+
+        if (i % 7 == 0) {
+            int* value = strmap_del(&map, key);
+            printf("Deleted '%s' -> %d\n", key, *value);
+            free(key);
+        }
 
         if (i == 1024) {
             // Grow when we reach 75% of full capacity,
