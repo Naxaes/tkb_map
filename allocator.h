@@ -13,6 +13,11 @@
 #endif
 
 
+#if !defined(_Atomic) || __STDC_VERSION__ < 201112L
+#define _Atomic
+#endif
+
+
 static inline size_t round_up_to_nearest_power_of_2(size_t v) {
     v--;
     v |= v >> 1;
