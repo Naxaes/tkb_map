@@ -1,46 +1,42 @@
+#ifndef TKB_INCLUDE_MAP_H
+#define TKB_INCLUDE_MAP_H
+
+
+#ifdef ALLOCATOR
 #include "allocator.h"
-
-#include <stdint.h>
-#include <stddef.h>
-#include <math.h>
-
-typedef uint8_t  u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef int8_t  s8;
-typedef int16_t s16;
-typedef int32_t s32;
-typedef int64_t s64;
-
-typedef float  f32;
-typedef double f64;
+#else
+#include <stdlib.h>
+#include <string.h>
+typedef void* Allocator;
+static Allocator allocator_system = NULL;
+#define allocate(allocator, size)                malloc(size)
+#define deallocate(allocator, memory, old_size)  free(memory)
+#endif
 
 
-
-
-typedef size_t (*hash_function)(const void* key, size_t stride);
-typedef int (*compare_function)(const void* a, const void* b, size_t stride);
-
-/// How many percentage of the capacity the hashmap
-/// should be full before it reallocates.
-static const f32 HASHMAP_DEFAULT_LOAD_FACTOR = 0.75f;
-/// How much the hashmap should grow in capacity when
-/// it reallocates.
-static const f32 HASHMAP_DEFAULT_GROW_FACTOR = 2.0f;
-
-static const size_t HASHMAP_EMPTY_SLOT = 0xFFFFFFFFFFFFFFFFULL;
+typedef unsigned char  u8;
+typedef unsigned short u16;
 
 
 typedef struct HashMapHeader {
     /// Custom allocator to use for the allocation,
-    /// reallocation and deallocation of the hashmap.
-    struct Allocator* allocator;
+    /// and deallocation of the hashmap.
+    Allocator* allocator;
+
+    /// The number of keys and values in the hashmap.
     size_t count;
+
+    /// The capacity of the keys and values in the hashmap.
+    /// NOTE: This is not effected by the load factor.
     size_t capacity;
-    size_t index_mask;
+
+    /// The capacity of the indices in the hashmap.
+    /// This capacity is effected by the load factor
+    /// and rounded up to a power of 2.
     size_t index_capacity;
+
+    /// The mask used to get the correct index size.
+    size_t index_mask;
 
     /// Load factor is a percentage of the capacity
     /// before the hashmap will grow.
@@ -57,72 +53,130 @@ typedef struct HashMapHeader {
     /// its current capacity.
     u8 grow_factor;
 
-    u8 key_stride;
-    u8 value_stride;
-    u8 index_stride;
+    /// The stride of the keys in the hashmap.
+    u16 key_stride;
+
+    /// The stride of the values in the hashmap.
+    u16 value_stride;
+
+    /// The stride of the indices in the hashmap.
+    u16 index_stride;
 
     // Following this header is:
-    // indices[load_factor * capacity * index_stride]
+    // indices[index_capacity * index_stride]
     // keys[capacity * key_stride],
     // values[capacity * value_stride]
 } HashMapHeader;
 
-/// A hashmap is a pointer to the values
-/// The header is located before the values
 typedef void* HashMap;
-#define HASHMAP_HEADER(hashmap) ((HashMapHeader*)(hashmap) - 1)
 
-static inline
-size_t hashmap_grow_capacity(size_t capacity, u8 grow_factor) {
-    return (size_t)ceil(((f64)grow_factor / 100.0 + 1.0) * (f64) capacity);
+typedef size_t (*hash_function)(const void* key, size_t stride);
+typedef int    (*compare_function)(const void* a, const void* b, size_t stride);
+
+int       hashmap_set_load_factor(HashMap* map, float load_factor);
+int       hashmap_set_grow_factor(HashMap* map, float grow_factor);
+size_t    hashmap_count(const HashMap* hashmap);
+size_t    hashmap_capacity(const HashMap* hashmap);
+u8*       hashmap_keys(const HashMap* hashmap);
+void*     hashmap_values(const HashMap* hashmap);
+HashMap*  hashmap_new(Allocator* allocator, size_t capacity, float load_factor, size_t key_stride, size_t value_stride);
+void      hashmap_free(HashMap** map);
+void*     hashmap_get(const HashMap* map, const void* key, hash_function hash_key, compare_function compare_key);
+int       hashmap_set(HashMap** map, const void* key, const void* value, hash_function hash_key, compare_function compare_key);
+void*     hashmap_del(HashMap** map, const void* key, hash_function hash_key, compare_function compare_key);
+void      hashmap_grow(HashMap** map, hash_function hash_key, compare_function compare_key);
+
+#endif  // TKB_INCLUDE_MAP_H
+
+
+#ifdef TKB_MAP_IMPLEMENTATION
+
+/// How many percentage of the index capacity that
+/// should be full before it reallocates.
+static const float HASHMAP_DEFAULT_LOAD_FACTOR = 0.75f;
+
+/// How much the hashmap should grow in capacity when
+/// it reallocates.
+static const float HASHMAP_DEFAULT_GROW_FACTOR = 1.5f;
+
+/// The value that is used to mark a slot as empty,
+/// (needs to be masked with the index_mask).
+/// Subtracting 1 (after being masked) will give us
+/// the value that is used to mark a slot as deleted.
+static const size_t HASHMAP_EMPTY_SLOT = 0xFFFFFFFFFFFFFFFFULL;
+
+#define MAP_HASH_FUNCTION    hash_string
+#define MAP_COMPARE_FUNCTION compare_string
+
+static inline size_t ceil(float x) {
+    return (size_t)x + 1;
 }
 
+static inline size_t round_up_to_nearest_power_of_2(size_t v) {
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v |= v >> 32;
+    v++;
 
-static inline
-size_t hashmap_index_stride(size_t capacity) {
+    return v;
+}
+
+static inline HashMapHeader* hashmap_header(const HashMap* hashmap) {
+    return (HashMapHeader*)(hashmap) - 1;
+}
+
+static inline size_t hashmap_grow_capacity(size_t capacity, u8 grow_factor) {
+    float factor = (float)grow_factor / 100.0f + 1.0f;
+    return ceil(factor * (float)capacity);
+}
+
+// NOTE: We could've used the whole range, but if the user
+//       wants to use a load factor of 1, then we would
+//       have to grow the hashmap before it reaches the
+//       capacity, as this value is used to check if the
+//       slot is empty or deleted.
+static inline size_t hashmap_index_stride(size_t capacity) {
     if      (capacity < 128)         return 1;
     else if (capacity < 32768)       return 2;
     else if (capacity < 2147483648)  return 4;
     else                             return 8;
 }
 
-static inline
-size_t hashmap_index_mask(size_t capacity) {
+static inline size_t hashmap_index_mask(size_t capacity) {
     if      (capacity < 128)         return 0xFFULL;
     else if (capacity < 32768)       return 0xFFFFULL;
     else if (capacity < 2147483648)  return 0xFFFFFFFFULL;
     else                             return 0xFFFFFFFFFFFFFFFFULL;
 }
 
-static inline
-size_t hashmap_index_capacity(size_t capacity, u8 load_factor) {
-    return round_up_to_nearest_power_of_2(
-            (size_t)ceil((100.0 / (f64)load_factor) * (f64) capacity)
-    );
+static inline size_t hashmap_index_capacity(size_t capacity, u8 load_factor) {
+    float factor = 100.0f / (float)load_factor;
+    return round_up_to_nearest_power_of_2(ceil(factor * (float) capacity));
 }
 
-static inline
 int hashmap_set_load_factor(HashMap* map, float load_factor) {
     if (load_factor < 0.01f || load_factor > 1.0f)
         return 0;
 
-    HashMapHeader* header = HASHMAP_HEADER(map);
+    HashMapHeader* header = hashmap_header(map);
     header->load_factor = (u8)(load_factor * 100.0f);
     return 1;
 }
 
-static inline
 int hashmap_set_grow_factor(HashMap* map, float grow_factor) {
     if (grow_factor < 0.1f || grow_factor > 2.5f)
         return 0;
 
-    HashMapHeader* header = HASHMAP_HEADER(map);
+    HashMapHeader* header = hashmap_header(map);
     header->grow_factor = (u8)(grow_factor * 100.0f);
     return 1;
 }
 
-static inline
-size_t hashmap_total_size(size_t capacity, size_t index_capacity, size_t index_stride, size_t key_stride, size_t value_stride) {
+static inline size_t hashmap_total_size(size_t capacity, size_t index_capacity, size_t index_stride, size_t key_stride, size_t value_stride) {
     size_t total_size =
         sizeof(HashMapHeader) +                             // Header
         (index_capacity * index_stride) +                   // Indices
@@ -131,25 +185,23 @@ size_t hashmap_total_size(size_t capacity, size_t index_capacity, size_t index_s
     return total_size;
 }
 
-static inline
 size_t hashmap_count(const HashMap* hashmap) {
-    return HASHMAP_HEADER(hashmap)->count;
+    return hashmap_header(hashmap)->count;
 }
 
-static inline
 size_t hashmap_capacity(const HashMap* hashmap) {
-    return HASHMAP_HEADER(hashmap)->capacity;
+    return hashmap_header(hashmap)->capacity;
 }
 
 u8* hashmap_keys(const HashMap* hashmap) {
-    HashMapHeader* header = HASHMAP_HEADER(hashmap);
+    HashMapHeader* header = hashmap_header(hashmap);
     size_t index_stride = hashmap_index_stride(header->capacity);
     size_t offset = header->index_capacity * index_stride;
     return (u8*)hashmap + offset;
 }
 
 void* hashmap_values(const HashMap* hashmap) {
-    HashMapHeader* header = HASHMAP_HEADER(hashmap);
+    HashMapHeader* header = hashmap_header(hashmap);
     size_t index_stride = hashmap_index_stride(header->capacity);
     size_t offset =
             header->index_capacity * index_stride +
@@ -157,7 +209,7 @@ void* hashmap_values(const HashMap* hashmap) {
     return (u8*)hashmap + offset;
 }
 
-HashMap* hashmap_new(struct Allocator* allocator, size_t capacity, float load_factor, size_t key_stride, size_t value_stride) {
+HashMap* hashmap_new(Allocator* allocator, size_t capacity, float load_factor, size_t key_stride, size_t value_stride) {
     if (load_factor < 0.01f || load_factor > 1.0f || capacity == 0)
         return NULL;
 
@@ -178,11 +230,11 @@ HashMap* hashmap_new(struct Allocator* allocator, size_t capacity, float load_fa
     memset(header+1, (u8)HASHMAP_EMPTY_SLOT, index_capacity * index_stride);
 
     *header = (HashMapHeader) {
-        .allocator    = allocator,
+        .allocator      = allocator,
         .count          = 0,
         .capacity       = capacity,
-        .index_mask     = index_mask,
         .index_capacity = index_capacity,
+        .index_mask     = index_mask,
         .load_factor    = load,
         .grow_factor    = grow,
         .key_stride     = key_stride,
@@ -194,7 +246,7 @@ HashMap* hashmap_new(struct Allocator* allocator, size_t capacity, float load_fa
 }
 
 void hashmap_free(HashMap** map) {
-    HashMapHeader* header = HASHMAP_HEADER(*map);
+    HashMapHeader* header = hashmap_header(*map);
     size_t index_capacity = header->index_capacity;
     size_t index_stride   = header->index_stride;
     size_t key_stride     = header->key_stride;
@@ -207,7 +259,7 @@ void hashmap_free(HashMap** map) {
 void hashmap_grow(HashMap** map, hash_function hash_key, compare_function compare_key);
 
 void* hashmap_get(const HashMap* map, const void* key, hash_function hash_key, compare_function compare_key) {
-    HashMapHeader* header = HASHMAP_HEADER(map);
+    HashMapHeader* header = hashmap_header(map);
     size_t capacity       = header->capacity;
     size_t key_stride     = header->key_stride;
     size_t value_stride   = header->value_stride;
@@ -246,14 +298,13 @@ void* hashmap_get(const HashMap* map, const void* key, hash_function hash_key, c
 
 
 int hashmap_set(HashMap** map, const void* key, const void* value, hash_function hash_key, compare_function compare_key) {
-    HashMapHeader* header = HASHMAP_HEADER(*map);
+    HashMapHeader* header = hashmap_header(*map);
     size_t capacity       = header->capacity;
     size_t key_stride     = header->key_stride;
     size_t value_stride   = header->value_stride;
     size_t index_capacity = header->index_capacity;
     size_t index_stride   = header->index_stride;
     size_t index_mask     = header->index_mask;
-    size_t load_factor    = header->load_factor;
     size_t count          = header->count;
     size_t counter        = count;
 
@@ -270,7 +321,7 @@ int hashmap_set(HashMap** map, const void* key, const void* value, hash_function
         size_t slot  = *(size_t*)(indices + index * index_stride) & index_mask;
 
         if (slot >= deleted_slot) {
-            if (capacity * load_factor <= count * 100ULL) {
+            if (count >= capacity) {
                 hashmap_grow(map, hash_key, compare_key);
                 return hashmap_set(map, key, value, hash_key, compare_key);
             }
@@ -310,7 +361,7 @@ int hashmap_set(HashMap** map, const void* key, const void* value, hash_function
 
 
 void* hashmap_del(HashMap** map, const void* key, hash_function hash_key, compare_function compare_key) {
-    HashMapHeader* header = HASHMAP_HEADER(*map);
+    HashMapHeader* header = hashmap_header(*map);
     size_t capacity       = header->capacity;
     size_t key_stride     = header->key_stride;
     size_t value_stride   = header->value_stride;
@@ -396,17 +447,17 @@ void* hashmap_del(HashMap** map, const void* key, hash_function hash_key, compar
 
 
 void hashmap_grow(HashMap** map, hash_function hash_key, compare_function compare_key) {
-    HashMapHeader* old_header = HASHMAP_HEADER(*map);
+    HashMapHeader* old_header = hashmap_header(*map);
     size_t old_capacity       = old_header->capacity;
     size_t old_index_capacity = old_header->index_capacity;
     size_t old_index_stride   = old_header->index_stride;
 
-    struct Allocator* allocator = old_header->allocator;
-    size_t count                = old_header->count;
-    u8     load_factor          = old_header->load_factor;
-    size_t key_stride           = old_header->key_stride;
-    size_t value_stride         = old_header->value_stride;
-    u8     grow_factor          = old_header->grow_factor;
+    Allocator* allocator = old_header->allocator;
+    size_t count         = old_header->count;
+    u8     load_factor   = old_header->load_factor;
+    size_t key_stride    = old_header->key_stride;
+    size_t value_stride  = old_header->value_stride;
+    u8     grow_factor   = old_header->grow_factor;
 
     size_t new_capacity       = hashmap_grow_capacity(old_capacity, grow_factor);
     size_t new_index_capacity = hashmap_index_capacity(new_capacity, load_factor);
@@ -449,18 +500,11 @@ void hashmap_grow(HashMap** map, hash_function hash_key, compare_function compar
 
 
 
-
-
-
-
-
-
 size_t hash_string(const void* key, size_t stride) {
     (void)stride;
     const char* data = *(const char**) key;
-    size_t len = strlen(data);
-    u64 seed = 0;
-    for (size_t i = 0; i < len; ++i) {
+    size_t seed = 0;
+    for (size_t i = 0; data[i] != '\0'; ++i) {
         seed ^= data[i] + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
     return seed;
@@ -470,34 +514,46 @@ int compare_string(const void* key, const void* candidate, size_t stride) {
     (void)stride;
     const char* str_a = *(const char**)key;
     const char* str_b = *(const char**)candidate;
-    size_t len = strlen(str_a);
-    for (size_t i = 0; i < len; ++i) {
+    for (size_t i = 0; str_a[i] != '\0' && str_b[i] != '\0'; ++i) {
         if (str_a[i] != str_b[i]) {
             return 1;
         }
     }
     return 0;
 }
-
-
-#define MAP_HASH_FUNCTION    hash_string
-#define MAP_COMPARE_FUNCTION compare_string
+#endif  // TKB_MAP_IMPLEMENTATION
 
 
 
 #define MAP_DEFINE_H(Class, prefix, KEY, VALUE)                                                                                                                                                                      \
-    static inline Class*  prefix##_new(struct Allocator* allocator, size_t capacity)                                  { return (Class*) hashmap_new(allocator, capacity, HASHMAP_DEFAULT_LOAD_FACTOR, sizeof(KEY), sizeof(VALUE));  }                                           \
-    static inline Class*  prefix##_new_with_load_factor(struct Allocator* allocator, size_t capacity, float factor)   { return (Class*) hashmap_new(allocator, capacity, factor, sizeof(KEY), sizeof(VALUE));  }                                           \
-    static inline u64     prefix##_count(const Class* map)                                                            { return hashmap_count((const HashMap*)map);    }                                                                           \
-    static inline u64     prefix##_capacity(const Class* map)                                                         { return hashmap_capacity((const HashMap*)map); }                                                                           \
-    static inline KEY*    prefix##_keys(const Class* map)                                                             { return (KEY*)   hashmap_keys((const HashMap*)map);     }                                                                  \
-    static inline VALUE*  prefix##_values(const Class* map)                                                           { return (VALUE*) hashmap_values((const HashMap*)map);   }                                                                  \
-    static inline VALUE*  prefix##_get(const Class* map, KEY key)                                                     { return (VALUE*) hashmap_get((const HashMap*)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }          \
-    static inline int     prefix##_set(Class** map, KEY key, VALUE value)                                             { return hashmap_set((HashMap**)map, (const void*)&key, (const void*)&value, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
-    static inline VALUE*  prefix##_del(Class** map, KEY key)                                                          { return hashmap_del((HashMap**)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
-    static inline void    prefix##_grow(Class** map)                                                                  { hashmap_grow((HashMap**)map, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }                                                 \
-    static inline int     prefix##_set_load_factor(Class* map, float factor)                                          { return hashmap_set_load_factor((HashMap*)map, factor);  }                                        \
-    static inline int     prefix##_set_grow_factor(Class* map, float factor)                                          { return hashmap_set_grow_factor((HashMap*)map, factor);  }                                        \
-    static inline void    prefix##_free(Class** map)                                                                  { hashmap_free((HashMap**)map); }                                                                                           \
+    static inline Class*  prefix##_new(Allocator* allocator, size_t capacity);                                 \
+    static inline Class*  prefix##_new_with_load_factor(Allocator* allocator, size_t capacity, float factor);  \
+    static inline size_t  prefix##_count(const Class* map);                                                    \
+    static inline size_t  prefix##_capacity(const Class* map);                                                 \
+    static inline KEY*    prefix##_keys(const Class* map);                                                     \
+    static inline VALUE*  prefix##_values(const Class* map);                                                   \
+    static inline VALUE*  prefix##_get(const Class* map, KEY key);                                             \
+    static inline int     prefix##_set(Class** map, KEY key, VALUE value);                                     \
+    static inline VALUE*  prefix##_del(Class** map, KEY key);                                                  \
+    static inline void    prefix##_grow(Class** map);                                                          \
+    static inline int     prefix##_set_load_factor(Class* map, float factor);                                  \
+    static inline int     prefix##_set_grow_factor(Class* map, float factor);                                  \
+    static inline void    prefix##_free(Class** map);                                                          \
+
+
+#define MAP_DEFINE_C(Class, prefix, KEY, VALUE)                                                                                                                                                                      \
+    static inline Class*  prefix##_new(Allocator* allocator, size_t capacity)                                  { return (Class*) hashmap_new(allocator, capacity, HASHMAP_DEFAULT_LOAD_FACTOR, sizeof(KEY), sizeof(VALUE));  }                                           \
+    static inline Class*  prefix##_new_with_load_factor(Allocator* allocator, size_t capacity, float factor)   { return (Class*) hashmap_new(allocator, capacity, factor, sizeof(KEY), sizeof(VALUE));  }                                           \
+    static inline size_t  prefix##_count(const Class* map)                                                     { return hashmap_count((const HashMap*)map);    }                                                                           \
+    static inline size_t  prefix##_capacity(const Class* map)                                                  { return hashmap_capacity((const HashMap*)map); }                                                                           \
+    static inline KEY*    prefix##_keys(const Class* map)                                                      { return (KEY*)   hashmap_keys((const HashMap*)map);     }                                                                  \
+    static inline VALUE*  prefix##_values(const Class* map)                                                    { return (VALUE*) hashmap_values((const HashMap*)map);   }                                                                  \
+    static inline VALUE*  prefix##_get(const Class* map, KEY key)                                              { return (VALUE*) hashmap_get((const HashMap*)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }          \
+    static inline int     prefix##_set(Class** map, KEY key, VALUE value)                                      { return hashmap_set((HashMap**)map, (const void*)&key, (const void*)&value, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
+    static inline VALUE*  prefix##_del(Class** map, KEY key)                                                   { return hashmap_del((HashMap**)map, (const void*)&key, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }   \
+    static inline void    prefix##_grow(Class** map)                                                           { hashmap_grow((HashMap**)map, MAP_HASH_FUNCTION, MAP_COMPARE_FUNCTION);  }                                                 \
+    static inline int     prefix##_set_load_factor(Class* map, float factor)                                   { return hashmap_set_load_factor((HashMap*)map, factor);  }                                        \
+    static inline int     prefix##_set_grow_factor(Class* map, float factor)                                   { return hashmap_set_grow_factor((HashMap*)map, factor);  }                                        \
+    static inline void    prefix##_free(Class** map)                                                           { hashmap_free((HashMap**)map); }                                                                                           \
 
 

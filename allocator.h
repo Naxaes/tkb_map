@@ -71,14 +71,14 @@ static inline size_t round_up_to_nearest_power_of_2(size_t v) {
  */
 typedef void* (*alloc_proc)(void* data, size_t size, void* memory, size_t old_size);
 
-struct Allocator {
+typedef struct Allocator {
     void* data;
     alloc_proc alloc;
     ALLOCATOR_DEBUG_BLOCK(
             const char* name;
             int id;
     )
-};
+} Allocator;
 
 
 enum AllocatorMode {

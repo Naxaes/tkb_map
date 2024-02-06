@@ -1,8 +1,14 @@
+
+#include <stdio.h>
+
 #include "hashmap.h"
 
+#define TKB_MAP_IMPLEMENTATION
+#include "hashmap.h"
 
 typedef struct StrMap StrMap;
 MAP_DEFINE_H(StrMap, strmap, const char*, int)
+MAP_DEFINE_C(StrMap, strmap, const char*, int)
 
 
 
@@ -17,6 +23,8 @@ int main(int argc, const char* argv[]) {
     // Grow by 200% when we reach full capacity.
     strmap_set_grow_factor(map, 2.0f);
 
+    char** all_keys = malloc(0xFFFFF * sizeof(const char*));
+
     for (int i = 0; i < 0xFFFFF; ++i) {
         int size = (rand() & 31) + 2;
         char* key = malloc(size);
@@ -24,12 +32,21 @@ int main(int argc, const char* argv[]) {
             key[j] = 'A' + (char)(rand() % ('Z' - 'A' + 1));
         }
         key[size-1] = 0;
+        all_keys[i] = key;
+
         strmap_set(&map, key, i);
 
-        if (i % 7 == 0) {
-            int* value = strmap_del(&map, key);
-            printf("Deleted '%s' -> %d\n", key, *value);
-            free(key);
+        if (i > 0 && i % 971 == 0) {
+            char* key_ = NULL;
+            int j = 0;
+            while (key_ == NULL) {
+                j = rand() % i;
+                key_ = all_keys[j];
+            }
+            int* value = strmap_del(&map, key_);
+            printf("Deleted '%s' -> %d\n", key_, *value);
+            free(key_);
+            all_keys[j] = NULL;
         }
 
         if (i == 1024) {

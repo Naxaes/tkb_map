@@ -1,12 +1,13 @@
+#define TKB_MAP_IMPLEMENTATION
 #include "hashmap.h"
 
 
 typedef struct StrMap StrMap;
-MAP_DEFINE_H(StrMap, strmap, const char*, int)
+MAP_DEFINE_C(StrMap, strmap, const char*, int)
 
 
 int LLVMFuzzerTestOneInput(const u8* data, size_t size) {
-    set_log_filter_all(LOG_ID_NONE);
+    // set_log_filter_all(LOG_ID_NONE);
 
     StrMap* map = strmap_new_with_load_factor(&allocator_system, 8, 0.5f);
 
